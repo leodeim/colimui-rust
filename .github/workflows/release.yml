@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - "main"
+    tags:
+      - "v*"
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked
+
+  release:
+    name: Build and publish release
+    needs: test
+    if: github.event_name == 'push'
+    permissions:
+      contents: write
+    # Serialize runs so concurrent pushes to main cannot race on the next tag.
+    concurrency:
+      group: release
+    # macOS runner: the menu bar (tray-icon) needs the macOS SDK for the darwin
+    # binaries; linux binaries are cross-compiled as static musl builds with zig.
+    runs-on: macos-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          # Full history so the latest release tag is available for the bump.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Determine release tag
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "RELEASE_TAG=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          else
+            latest=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+            latest=${latest:-v0.0.0}
+            IFS=. read -r major minor patch <<<"${latest#v}"
+            echo "RELEASE_TAG=v${major}.${minor}.$((patch + 1))" >> "$GITHUB_ENV"
+          fi
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          pip3 install --break-system-packages ziglang cargo-zigbuild
+
+      - name: Build release binaries
+        env:
+          COLIMUI_VERSION: ${{ env.RELEASE_TAG }}
+        run: |
+          mkdir -p dist
+          for pair in darwin/arm64/aarch64-apple-darwin darwin/amd64/x86_64-apple-darwin \
+                      linux/amd64/x86_64-unknown-linux-musl linux/arm64/aarch64-unknown-linux-musl; do
+            IFS=/ read -r os arch target <<<"$pair"
+            build=build
+            if [[ "$os" == linux ]]; then
+              build=zigbuild
+            fi
+            cargo "$build" --locked --release --target "$target"
+            cp "target/$target/release/colimuir" "dist/colimuir_${os}_${arch}"
+          done
+
+      - name: Create checksums
+        working-directory: dist
+        run: shasum -a 256 colimuir_* > checksums.txt
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" dist/* --clobber
+          else
+            # Creating the release also creates the tag at the built commit.
+            gh release create "${RELEASE_TAG}" dist/* \
+              --target "$GITHUB_SHA" \
+              --generate-notes \
+              --title "colimuir ${RELEASE_TAG}"
+          fi
